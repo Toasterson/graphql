@@ -38,6 +38,8 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/pkg/errors"
 )
@@ -96,17 +98,36 @@ func (c *Client) Run(ctx context.Context, req *Request, resp interface{}) error 
 	return c.runWithJSON(ctx, req, resp)
 }
 
-func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}) error {
-	var requestBody bytes.Buffer
+func encodeOperationsObj(req *Request, requestBody *bytes.Buffer) error {
 	requestBodyObj := struct {
 		Query     string                 `json:"query"`
 		Variables map[string]interface{} `json:"variables"`
 	}{
-		Query:     req.q,
+		Query:     strings.ReplaceAll(strings.ReplaceAll(req.q, "\n", " "), "\t", " "),
 		Variables: req.vars,
 	}
-	if err := json.NewEncoder(&requestBody).Encode(requestBodyObj); err != nil {
+
+	if len(req.files) > 0 {
+		if requestBodyObj.Variables == nil {
+			requestBodyObj.Variables = make(map[string]interface{})
+		}
+
+		for _, file := range req.files {
+			requestBodyObj.Variables[file.Field] = nil
+		}
+	}
+
+	if err := json.NewEncoder(requestBody).Encode(requestBodyObj); err != nil {
 		return errors.Wrap(err, "encode body")
+	}
+
+	return nil
+}
+
+func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}) error {
+	var requestBody bytes.Buffer
+	if err := encodeOperationsObj(req, &requestBody); err != nil {
+		return err
 	}
 	c.logf(">> variables: %v", req.vars)
 	c.logf(">> query: %s", req.q)
@@ -153,37 +174,60 @@ func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}
 func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp interface{}) error {
 	var requestBody bytes.Buffer
 	writer := multipart.NewWriter(&requestBody)
-	if err := writer.WriteField("query", req.q); err != nil {
+	var operationsBuffer bytes.Buffer
+	if err := encodeOperationsObj(req, &operationsBuffer); err != nil {
+		return err
+	}
+
+	if err := writer.WriteField("operations", operationsBuffer.String()); err != nil {
 		return errors.Wrap(err, "write query field")
 	}
-	var variablesBuf bytes.Buffer
-	if len(req.vars) > 0 {
-		variablesField, err := writer.CreateFormField("variables")
-		if err != nil {
-			return errors.Wrap(err, "create variables field")
+
+	c.logf("operations >> %s", operationsBuffer)
+
+	if len(req.files) > 0 {
+		mapObj := make(map[string][]string)
+		for fileIndex, file := range req.files {
+			mapObj[strconv.Itoa(fileIndex)] = []string{fmt.Sprintf("variables.%s", file.Field)}
 		}
-		if err := json.NewEncoder(io.MultiWriter(variablesField, &variablesBuf)).Encode(req.vars); err != nil {
-			return errors.Wrap(err, "encode variables")
+		var mapBody bytes.Buffer
+
+		if err := json.NewEncoder(&mapBody).Encode(mapObj); err != nil {
+			return errors.Wrap(err, "encode mapObject")
 		}
+
+		if err := writer.WriteField("map", mapBody.String()); err != nil {
+			return errors.Wrap(err, "write map field")
+		}
+
+		c.logf("map >> %s", mapBody)
+		c.logf("number of files >> %d", len(req.files))
+
+		for fileIndex, file := range req.files {
+			part, err := writer.CreateFormFile(strconv.Itoa(fileIndex), file.Name)
+			if err != nil {
+				return errors.Wrap(err, "create form file")
+			}
+			if _, err := io.Copy(part, file.R); err != nil {
+				return errors.Wrap(err, "preparing file")
+			}
+		}
+	} else {
+
+		if err := writer.WriteField("map", `{}`); err != nil {
+			return errors.Wrap(err, "write map field")
+		}
+
+		c.logf("map >> %s", `{}`)
 	}
-	for i := range req.files {
-		part, err := writer.CreateFormFile(req.files[i].Field, req.files[i].Name)
-		if err != nil {
-			return errors.Wrap(err, "create form file")
-		}
-		if _, err := io.Copy(part, req.files[i].R); err != nil {
-			return errors.Wrap(err, "preparing file")
-		}
-	}
+
 	if err := writer.Close(); err != nil {
 		return errors.Wrap(err, "close writer")
 	}
-	c.logf(">> variables: %s", variablesBuf.String())
-	c.logf(">> files: %d", len(req.files))
-	c.logf(">> query: %s", req.q)
 	gr := &graphResponse{
 		Data: resp,
 	}
+
 	r, err := http.NewRequest(http.MethodPost, c.endpoint, &requestBody)
 	if err != nil {
 		return err
@@ -250,7 +294,7 @@ func ImmediatelyCloseReqBody() ClientOption {
 type ClientOption func(*Client)
 
 type graphErr struct {
-	Message string
+	Message string `json:"message"`
 }
 
 func (e graphErr) Error() string {
@@ -258,8 +302,8 @@ func (e graphErr) Error() string {
 }
 
 type graphResponse struct {
-	Data   interface{}
-	Errors []graphErr
+	Data   interface{} `json:"data"`
+	Errors []graphErr  `json:"errors,omitempty"`
 }
 
 // Request is a GraphQL request.
